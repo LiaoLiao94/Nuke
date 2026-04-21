@@ -2,6 +2,7 @@
 """
 Nuke Plugin Installer - 安装 .gizmo / .nk / .py 插件到 Nuke 用户目录
 支持添加到顶部菜单或节点工具栏
+修复：自动检测 .py 插件的入口函数，无需手动填写
 """
 
 import nuke
@@ -15,7 +16,7 @@ try:
     from PySide2 import QtWidgets, QtCore, QtGui
 except ImportError:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, messagebox
     USE_TK = True
 else:
     USE_TK = False
@@ -38,8 +39,8 @@ if not USE_TK:
             except:
                 parent = None
             super(PluginInstaller, self).__init__(parent)
-            self.setWindowTitle("Nuke 插件安装工具")
-            self.setMinimumSize(650, 500)
+            self.setWindowTitle("Nuke 插件安装工具 (自动检测入口)")
+            self.setMinimumSize(650, 550)
             self.setAcceptDrops(True)
             self.file_list = []
             self.init_ui()
@@ -94,6 +95,7 @@ if not USE_TK:
             location_layout.addWidget(QtWidgets.QLabel("菜单位置:"))
             self.menu_location_combo = QtWidgets.QComboBox()
             self.menu_location_combo.addItems(["顶部菜单栏 (Nuke)", "节点工具栏 (Nodes)"])
+            self.menu_location_combo.setCurrentIndex(0)
             location_layout.addWidget(self.menu_location_combo)
             menu_layout.addLayout(location_layout)
 
@@ -195,6 +197,28 @@ if not USE_TK:
                 return
             self._install_files(self.file_list)
 
+        def _detect_entry_functions(self, file_path):
+            """检测 Python 文件中可能作为入口的函数名"""
+            candidates = []
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                patterns = [
+                    r'^def\s+(show)\s*\(',
+                    r'^def\s+(main)\s*\(',
+                    r'^def\s+(show_ui)\s*\(',
+                    r'^def\s+(open_window)\s*\(',
+                    r'^def\s+(launch)\s*\(',
+                    r'^def\s+(show_dialog)\s*\(',
+                    r'^def\s+(show_repath_dialog)\s*\(',
+                ]
+                for pat in patterns:
+                    matches = re.findall(pat, content, re.MULTILINE)
+                    candidates.extend(matches)
+            except:
+                pass
+            return list(set(candidates))
+
         def _install_files(self, files):
             target_dir = self.target_dir_edit.text().strip()
             if not target_dir:
@@ -264,7 +288,30 @@ if not USE_TK:
                     entries.append((menu_label, command, category, is_node_menu))
                 elif ext == '.py':
                     module_name = file_path.stem
-                    command = f"import {module_name}; {module_name}.show() if hasattr({module_name}, 'show') else None"
+                    # 自动检测入口函数
+                    candidates = self._detect_entry_functions(str(file_path))
+                    entry_func = None
+                    if candidates:
+                        if len(candidates) == 1:
+                            entry_func = candidates[0]
+                        else:
+                            # 多个候选，弹出选择对话框
+                            func, ok = QtWidgets.QInputDialog.getItem(
+                                self, "选择入口函数", f"插件 {module_name} 有多个可能的入口函数，请选择:",
+                                candidates, 0, False
+                            )
+                            if ok and func:
+                                entry_func = func
+                    if not entry_func:
+                        # 如果没检测到，让用户手动输入
+                        entry_func, ok = QtWidgets.QInputDialog.getText(
+                            self, "入口函数", f"未检测到入口函数，请手动输入 {module_name} 的入口函数名:",
+                            text="show"
+                        )
+                        if not ok or not entry_func:
+                            entry_func = "show"
+                    # 使用双引号外部，单引号内部，避免语法错误
+                    command = f'import {module_name}; {module_name}.{entry_func}()'
                     menu_label = custom_name if custom_name else module_name
                     entries.append((menu_label, command, category, is_node_menu))
 
@@ -294,6 +341,14 @@ if not USE_TK:
                     menu_path = f"{cat}/{label}"
                 else:
                     menu_path = label
+                # 先尝试删除旧菜单项（避免重复）
+                new_code += f"try:\n"
+                if is_node:
+                    new_code += f"    toolbar.findItem('{menu_path}').delete()\n"
+                else:
+                    new_code += f"    menubar.findItem('{menu_path}').delete()\n"
+                new_code += f"except:\n    pass\n"
+                # 添加新命令
                 if is_node:
                     new_code += f"toolbar.addCommand('{menu_path}', '{cmd}')\n"
                 else:
@@ -316,8 +371,11 @@ if not USE_TK:
         _installer_win = PluginInstaller()
         _installer_win.show()
 
-# ==================== Tkinter 版本（略，同之前但增加节点菜单选项） ====================
-# 为了简洁，此处省略 Tkinter 版，实际使用中 PySide 版已足够
+# ==================== Tkinter 版本（简略） ====================
+else:
+    def show_installer():
+        import tkinter.messagebox as msgbox
+        msgbox.showinfo("提示", "PySide2 未安装，请安装 PySide2 后使用本工具。")
 
 def main():
     show_installer()
