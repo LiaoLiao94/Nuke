@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Nuke Plugin Installer - 安装 .gizmo / .nk / .py 插件到 Nuke 用户目录
-支持添加到顶部菜单或节点工具栏
-修复：自动检测 .py 插件的入口函数，无需手动填写
+Nuke Plugin Installer - 安装 / 卸载 .gizmo / .nk / .py 插件
+支持层级菜单、节点位置优化、自动菜单清理
+更新：.gizmo 默认在鼠标位置创建节点
 """
 
 import nuke
@@ -30,8 +30,176 @@ def get_nuke_user_dir():
     return str(nuke_dir)
 
 
-# ==================== PySide 版本 ====================
+# ==================== 卸载对话框 ====================
 if not USE_TK:
+    class UninstallDialog(QtWidgets.QDialog):
+        def __init__(self, target_dir, parent=None):
+            super(UninstallDialog, self).__init__(parent)
+            self.setWindowTitle("卸载已安装插件")
+            self.setMinimumSize(700, 450)
+            self.target_dir = Path(target_dir)
+            self.plugins = []
+            self.init_ui()
+            self.scan_installed()
+
+        def init_ui(self):
+            layout = QtWidgets.QVBoxLayout(self)
+
+            self.table = QtWidgets.QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["文件名", "类型", "安装路径", "菜单状态"])
+            self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.setColumnWidth(0, 150)
+            self.table.setColumnWidth(1, 60)
+            self.table.setColumnWidth(2, 350)
+            layout.addWidget(self.table)
+
+            btn_layout = QtWidgets.QHBoxLayout()
+            self.uninstall_btn = QtWidgets.QPushButton("卸载选中")
+            self.uninstall_btn.clicked.connect(self.uninstall_selected)
+            self.uninstall_btn.setStyleSheet("background-color: #d9534f; color: white;")
+            btn_layout.addWidget(self.uninstall_btn)
+            self.refresh_btn = QtWidgets.QPushButton("刷新列表")
+            self.refresh_btn.clicked.connect(self.scan_installed)
+            btn_layout.addWidget(self.refresh_btn)
+            layout.addLayout(btn_layout)
+
+            self.status_label = QtWidgets.QLabel("")
+            layout.addWidget(self.status_label)
+
+        def scan_installed(self):
+            self.plugins.clear()
+            self.table.setRowCount(0)
+
+            for ext in ['*.gizmo', '*.py', '*.nk']:
+                for file in self.target_dir.glob(ext):
+                    if file.is_file():
+                        self.plugins.append({
+                            'name': file.name,
+                            'type': ext[1:],
+                            'path': str(file),
+                            'rel_path': str(file.relative_to(self.target_dir))
+                        })
+
+            menu_entries = self._get_menu_entries()
+            for p in self.plugins:
+                base_name = os.path.splitext(p['name'])[0]
+                has_menu = any(base_name in entry for entry in menu_entries)
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+
+                name_item = QtWidgets.QTableWidgetItem(p['name'])
+                name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(row, 0, name_item)
+
+                type_item = QtWidgets.QTableWidgetItem(p['type'])
+                type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(row, 1, type_item)
+
+                path_item = QtWidgets.QTableWidgetItem(p['path'])
+                path_item.setFlags(path_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(row, 2, path_item)
+
+                menu_status = "有菜单" if has_menu else "无菜单"
+                menu_item = QtWidgets.QTableWidgetItem(menu_status)
+                menu_item.setFlags(menu_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(row, 3, menu_item)
+
+            self.status_label.setText(f"共找到 {len(self.plugins)} 个已安装插件")
+
+        def _get_menu_entries(self):
+            menu_py = self.target_dir / "menu.py"
+            if not menu_py.exists():
+                return []
+            with open(menu_py, 'r', encoding='utf-8') as f:
+                content = f.read()
+            marker_start = "# === Nuke Plugin Installer Auto-Generated Menu Items ==="
+            marker_end = "# === End Auto-Generated ==="
+            pattern = re.escape(marker_start) + r"\n(.*?)" + re.escape(marker_end)
+            match = re.search(pattern, content, re.DOTALL)
+            if not match:
+                return []
+            block = match.group(1)
+            commands = re.findall(r"addCommand\('(.+?)',\s*'(.+?)'\)", block)
+            return [cmd for _, cmd in commands]
+
+        def uninstall_selected(self):
+            selected_rows = set()
+            for idx in self.table.selectedIndexes():
+                selected_rows.add(idx.row())
+            if not selected_rows:
+                QtWidgets.QMessageBox.warning(self, "提示", "请先选择要卸载的插件")
+                return
+
+            reply = QtWidgets.QMessageBox.question(
+                self, "确认卸载",
+                f"将删除选中的 {len(selected_rows)} 个插件文件并清理菜单，是否继续？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+            removed = []
+            for row in sorted(selected_rows, reverse=True):
+                plugin = self.plugins[row]
+                try:
+                    os.remove(plugin['path'])
+                    removed.append(plugin)
+                except Exception as e:
+                    print(f"删除失败 {plugin['path']}: {e}")
+
+            if removed:
+                self._clean_menu_entries(removed)
+
+            self.scan_installed()
+            QtWidgets.QMessageBox.information(self, "完成", f"已卸载 {len(removed)} 个插件，请重启 Nuke 使更改生效")
+
+        def _clean_menu_entries(self, removed_plugins):
+            menu_py = self.target_dir / "menu.py"
+            if not menu_py.exists():
+                return
+            with open(menu_py, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            marker_start = "# === Nuke Plugin Installer Auto-Generated Menu Items ==="
+            marker_end = "# === End Auto-Generated ==="
+            pattern = re.escape(marker_start) + r"\n(.*?)" + re.escape(marker_end)
+            match = re.search(pattern, content, re.DOTALL)
+            if not match:
+                return
+
+            block = match.group(1)
+            lines = block.splitlines(keepends=True)
+            new_lines = []
+            removed_bases = {os.path.splitext(p['name'])[0] for p in removed_plugins}
+
+            for line in lines:
+                keep = True
+                for base in removed_bases:
+                    if f"createNode('{base}')" in line or f'createNode("{base}")' in line:
+                        keep = False
+                        break
+                    if f"import {base};" in line or f"import {base} " in line:
+                        keep = False
+                        break
+                    if f"scriptReadFile(r" in line and base in line:
+                        keep = False
+                        break
+                if keep:
+                    new_lines.append(line)
+
+            if new_lines:
+                new_block = "".join(new_lines)
+                new_content = content[:match.start(1)] + new_block + content[match.end(1):]
+            else:
+                new_content = content[:match.start()] + content[match.end():]
+
+            with open(menu_py, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+
+
+# ==================== 安装主界面 ====================
     class PluginInstaller(QtWidgets.QDialog):
         def __init__(self, parent=None):
             try:
@@ -49,7 +217,6 @@ if not USE_TK:
         def init_ui(self):
             layout = QtWidgets.QVBoxLayout(self)
 
-            # 目标目录
             dir_layout = QtWidgets.QHBoxLayout()
             dir_layout.addWidget(QtWidgets.QLabel("安装目录:"))
             self.target_dir_edit = QtWidgets.QLineEdit()
@@ -61,7 +228,6 @@ if not USE_TK:
             dir_layout.addWidget(self.browse_dir_btn)
             layout.addLayout(dir_layout)
 
-            # 文件列表
             layout.addWidget(QtWidgets.QLabel("要安装的插件文件:"))
             self.file_list_widget = QtWidgets.QListWidget()
             self.file_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -69,7 +235,6 @@ if not USE_TK:
             self.file_list_widget.setAcceptDrops(True)
             layout.addWidget(self.file_list_widget)
 
-            # 按钮行
             btn_layout = QtWidgets.QHBoxLayout()
             self.add_files_btn = QtWidgets.QPushButton("添加文件")
             self.add_files_btn.clicked.connect(self.add_files)
@@ -82,7 +247,6 @@ if not USE_TK:
             btn_layout.addWidget(self.clear_all_btn)
             layout.addLayout(btn_layout)
 
-            # 菜单选项
             self.menu_group = QtWidgets.QGroupBox("菜单选项")
             menu_layout = QtWidgets.QVBoxLayout(self.menu_group)
 
@@ -90,7 +254,6 @@ if not USE_TK:
             self.generate_menu_cb.setChecked(True)
             menu_layout.addWidget(self.generate_menu_cb)
 
-            # 菜单位置选择
             location_layout = QtWidgets.QHBoxLayout()
             location_layout.addWidget(QtWidgets.QLabel("菜单位置:"))
             self.menu_location_combo = QtWidgets.QComboBox()
@@ -99,11 +262,10 @@ if not USE_TK:
             location_layout.addWidget(self.menu_location_combo)
             menu_layout.addLayout(location_layout)
 
-            # 分类和名称
             cat_layout = QtWidgets.QHBoxLayout()
-            cat_layout.addWidget(QtWidgets.QLabel("菜单分类:"))
+            cat_layout.addWidget(QtWidgets.QLabel("菜单分类 (子菜单名称):"))
             self.menu_category_edit = QtWidgets.QLineEdit()
-            self.menu_category_edit.setPlaceholderText("例如: MyTools / AOV / ...")
+            self.menu_category_edit.setPlaceholderText("例如: NK / MyTools / Gizmos")
             cat_layout.addWidget(self.menu_category_edit)
             menu_layout.addLayout(cat_layout)
 
@@ -115,7 +277,6 @@ if not USE_TK:
 
             layout.addWidget(self.menu_group)
 
-            # 操作按钮
             action_layout = QtWidgets.QHBoxLayout()
             self.install_btn = QtWidgets.QPushButton("安装选中文件")
             self.install_btn.setStyleSheet("background-color: #4CAF50; color: white;")
@@ -124,9 +285,11 @@ if not USE_TK:
             self.install_all_btn = QtWidgets.QPushButton("安装全部")
             self.install_all_btn.clicked.connect(self.install_all)
             action_layout.addWidget(self.install_all_btn)
+            self.uninstall_btn = QtWidgets.QPushButton("卸载已安装插件")
+            self.uninstall_btn.clicked.connect(self.open_uninstaller)
+            action_layout.addWidget(self.uninstall_btn)
             layout.addLayout(action_layout)
 
-            # 状态栏
             self.status_label = QtWidgets.QLabel("就绪")
             layout.addWidget(self.status_label)
 
@@ -135,6 +298,10 @@ if not USE_TK:
                 QListWidget { border: 1px solid #ccc; min-height: 150px; }
                 QPushButton { padding: 6px; }
             """)
+
+        def open_uninstaller(self):
+            dlg = UninstallDialog(self.target_dir_edit.text(), self)
+            dlg.exec_()
 
         def dragEnterEvent(self, event):
             if event.mimeData().hasUrls():
@@ -198,7 +365,6 @@ if not USE_TK:
             self._install_files(self.file_list)
 
         def _detect_entry_functions(self, file_path):
-            """检测 Python 文件中可能作为入口的函数名"""
             candidates = []
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -235,16 +401,16 @@ if not USE_TK:
             success_count = 0
             skipped_count = 0
             error_count = 0
-            installed_files = []
+            installed_all = []
 
             for src in files:
                 src_path = Path(src)
                 if not src_path.exists():
                     error_count += 1
-                    self.status_label.setText(f"文件不存在: {src}")
                     continue
 
                 dst = target_path / src_path.name
+
                 if dst.exists():
                     reply = QtWidgets.QMessageBox.question(
                         self, "文件已存在",
@@ -256,16 +422,17 @@ if not USE_TK:
                     elif reply == QtWidgets.QMessageBox.No:
                         skipped_count += 1
                         continue
+
                 try:
                     shutil.copy2(src, dst)
                     success_count += 1
-                    installed_files.append(dst)
+                    installed_all.append(dst)
                 except Exception as e:
                     error_count += 1
                     self.status_label.setText(f"复制失败: {src} -> {e}")
 
-            if self.generate_menu_cb.isChecked():
-                self._generate_menu_entries(installed_files, target_dir)
+            if self.generate_menu_cb.isChecked() and installed_all:
+                self._generate_menu_entries(installed_all, target_dir)
 
             msg = f"安装完成: 成功 {success_count}, 跳过 {skipped_count}, 失败 {error_count}\n请重启 Nuke 以使菜单生效。"
             self.status_label.setText(msg)
@@ -283,19 +450,18 @@ if not USE_TK:
                 ext = file_path.suffix.lower()
                 if ext == '.gizmo':
                     node_name = file_path.stem
-                    command = f"nuke.createNode('{node_name}')"
+                    # 修复：添加 inpanel=False 使节点创建在鼠标位置附近
+                    command = f"nuke.createNode('{node_name}', inpanel=False)"
                     menu_label = custom_name if custom_name else node_name
                     entries.append((menu_label, command, category, is_node_menu))
                 elif ext == '.py':
                     module_name = file_path.stem
-                    # 自动检测入口函数
                     candidates = self._detect_entry_functions(str(file_path))
                     entry_func = None
                     if candidates:
                         if len(candidates) == 1:
                             entry_func = candidates[0]
                         else:
-                            # 多个候选，弹出选择对话框
                             func, ok = QtWidgets.QInputDialog.getItem(
                                 self, "选择入口函数", f"插件 {module_name} 有多个可能的入口函数，请选择:",
                                 candidates, 0, False
@@ -303,16 +469,18 @@ if not USE_TK:
                             if ok and func:
                                 entry_func = func
                     if not entry_func:
-                        # 如果没检测到，让用户手动输入
                         entry_func, ok = QtWidgets.QInputDialog.getText(
                             self, "入口函数", f"未检测到入口函数，请手动输入 {module_name} 的入口函数名:",
                             text="show"
                         )
                         if not ok or not entry_func:
                             entry_func = "show"
-                    # 使用双引号外部，单引号内部，避免语法错误
                     command = f'import {module_name}; {module_name}.{entry_func}()'
                     menu_label = custom_name if custom_name else module_name
+                    entries.append((menu_label, command, category, is_node_menu))
+                elif ext == '.nk':
+                    command = f'nuke.scriptReadFile(r"{file_path.as_posix()}")'
+                    menu_label = custom_name if custom_name else file_path.stem
                     entries.append((menu_label, command, category, is_node_menu))
 
             if not entries:
@@ -341,14 +509,12 @@ if not USE_TK:
                     menu_path = f"{cat}/{label}"
                 else:
                     menu_path = label
-                # 先尝试删除旧菜单项（避免重复）
                 new_code += f"try:\n"
                 if is_node:
                     new_code += f"    toolbar.findItem('{menu_path}').delete()\n"
                 else:
                     new_code += f"    menubar.findItem('{menu_path}').delete()\n"
                 new_code += f"except:\n    pass\n"
-                # 添加新命令
                 if is_node:
                     new_code += f"toolbar.addCommand('{menu_path}', '{cmd}')\n"
                 else:
@@ -361,6 +527,8 @@ if not USE_TK:
 
             self.status_label.setText(f"已更新 menu.py: {menu_py_path}")
 
+
+# ==================== 入口函数 ====================
     def show_installer():
         global _installer_win
         try:
@@ -371,7 +539,6 @@ if not USE_TK:
         _installer_win = PluginInstaller()
         _installer_win.show()
 
-# ==================== Tkinter 版本（简略） ====================
 else:
     def show_installer():
         import tkinter.messagebox as msgbox
